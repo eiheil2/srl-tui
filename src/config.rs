@@ -11,16 +11,24 @@ pub struct Config {
     /// The currently selected theme name.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Maximum new cards introduced per study session.
+    #[serde(default = "default_new_per_session")]
+    pub new_per_session: u32,
 }
 
 fn default_theme() -> String {
     "default".to_string()
 }
 
+fn default_new_per_session() -> u32 {
+    20
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            new_per_session: default_new_per_session(),
         }
     }
 }
@@ -45,8 +53,8 @@ impl Config {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config file: {:?}", path))?;
 
-        let config: Config = toml::from_str(&content)
-            .with_context(|| "Failed to parse config file")?;
+        let config: Config =
+            toml::from_str(&content).with_context(|| "Failed to parse config file")?;
 
         Ok(config)
     }
@@ -61,8 +69,7 @@ impl Config {
                 .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
         }
 
-        let content = toml::to_string_pretty(self)
-            .with_context(|| "Failed to serialize config")?;
+        let content = toml::to_string_pretty(self).with_context(|| "Failed to serialize config")?;
 
         fs::write(&path, content)
             .with_context(|| format!("Failed to write config file: {:?}", path))?;

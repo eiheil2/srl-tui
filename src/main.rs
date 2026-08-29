@@ -28,7 +28,7 @@ use ui::App;
 // ══════════════════════════════════════════════════════════════════════════
 
 #[derive(Parser, Debug)]
-#[command(name = "flashcards")]
+#[command(name = "srl")]
 #[command(author, version, about = "Anki-style spaced repetition flashcard TUI", long_about = None)]
 struct Args {
     /// Directory containing deck files
@@ -66,6 +66,10 @@ struct Args {
     /// Export all decks to Anki .apkg format (preserves scheduling)
     #[arg(short = 'A', long)]
     export_anki: Option<PathBuf>,
+
+    /// List all decks and exit
+    #[arg(long)]
+    list: bool,
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -89,12 +93,14 @@ fn main() -> Result<()> {
             return Ok(());
         }
         let deck = storage.import_csv(&csv_path, &args.import_name)?;
+        if deck.cards.is_empty() {
+            anyhow::bail!(
+                "No valid cards found in {} (expected rows of front,back[,tags])",
+                csv_path.display()
+            );
+        }
         storage.save_deck(&deck)?;
-        println!(
-            "Imported {} cards into '{}'",
-            deck.cards.len(),
-            deck.name
-        );
+        println!("Imported {} cards into '{}'", deck.cards.len(), deck.name);
         return Ok(());
     }
 
@@ -142,7 +148,10 @@ fn main() -> Result<()> {
     if let Some(backup_path) = args.import_backup {
         let (imported, skipped) = storage.import_backup(&backup_path)?;
         if skipped > 0 {
-            println!("Imported {} decks ({} skipped - already exist)", imported, skipped);
+            println!(
+                "Imported {} decks ({} skipped - already exist)",
+                imported, skipped
+            );
         } else {
             println!("Imported {} decks", imported);
         }
@@ -159,6 +168,11 @@ fn main() -> Result<()> {
         for deck in decks {
             if storage.deck_name_exists(&deck.name) {
                 skipped_names.push(deck.name);
+            } else if deck.cards.is_empty() {
+                eprintln!(
+                    "Warning: deck '{}' contains no valid cards, skipped",
+                    deck.name
+                );
             } else {
                 total_cards += deck.cards.len();
                 storage.save_deck(&deck)?;
@@ -168,7 +182,10 @@ fn main() -> Result<()> {
         }
 
         if saved_count > 0 {
-            println!("Imported {} deck(s) with {} total cards", saved_count, total_cards);
+            println!(
+                "Imported {} deck(s) with {} total cards",
+                saved_count, total_cards
+            );
         }
         if !skipped_names.is_empty() {
             println!("Skipped {} deck(s) (already exist):", skipped_names.len());
@@ -179,11 +196,33 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // List decks
+    if args.list {
+        let decks = storage.list_decks()?;
+        if decks.is_empty() {
+            println!("No decks found");
+        } else {
+            for deck in decks {
+                println!("{} ({} cards)", deck.name, deck.card_count);
+            }
+        }
+        return Ok(());
+    }
+
     // Run TUI
     run_tui(storage)
 }
 
 fn run_tui(storage: DeckStorage) -> Result<()> {
+    // Restore the terminal even if the app panics mid-render, otherwise the
+    // user's shell is left in raw mode on the alternate screen.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        original_hook(info);
+    }));
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();

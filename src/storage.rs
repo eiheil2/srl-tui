@@ -28,9 +28,10 @@ impl DeckStorage {
     fn install_bundled_decks(&self) {
         // Check if any decks exist - if so, user has already used the app
         if let Ok(entries) = fs::read_dir(&self.decks_dir) {
-            if entries.filter_map(|e| e.ok()).any(|e| {
-                e.path().extension().map_or(false, |ext| ext == "json")
-            }) {
+            if entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            {
                 return; // User already has decks, don't overwrite
             }
         }
@@ -57,11 +58,15 @@ impl DeckStorage {
         self.decks_dir.join(format!("{}.json", deck_id))
     }
 
-    /// Save a deck to disk.
+    /// Save a deck to disk (atomic: write to a temp file, then rename over
+    /// the destination so a crash can never leave a half-written JSON).
     pub fn save_deck(&self, deck: &Deck) -> Result<PathBuf> {
         let path = self.deck_path(&deck.id);
+        let tmp_path = self.decks_dir.join(format!("{}.json.tmp", deck.id));
         let json = serde_json::to_string_pretty(deck)?;
-        fs::write(&path, json)?;
+        fs::write(&tmp_path, json)?;
+        fs::rename(&tmp_path, &path)
+            .with_context(|| format!("Failed to replace deck file: {:?}", path))?;
         Ok(path)
     }
 
@@ -96,14 +101,13 @@ impl DeckStorage {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().map_or(false, |e| e == "json") {
+            if path.extension().is_some_and(|e| e == "json") {
                 if let Ok(json) = fs::read_to_string(&path) {
                     if let Ok(deck) = serde_json::from_str::<Deck>(&json) {
                         decks.push(DeckInfo {
                             id: deck.id,
                             name: deck.name,
                             card_count: deck.cards.len(),
-                            description: deck.description,
                         });
                     }
                 }
@@ -115,23 +119,43 @@ impl DeckStorage {
     }
 
     /// Import cards from a CSV file.
+    /// Format: front,back[,tags] — a leading header row is skipped only when
+    /// its first cell is literally "front" (case-insensitive).
     pub fn import_csv(&self, csv_path: &Path, deck_name: &str) -> Result<Deck> {
         let mut deck = Deck::new(deck_name.to_string());
         let content = fs::read_to_string(csv_path)?;
 
-        for (i, line) in content.lines().enumerate() {
-            // Skip header
-            if i == 0 && line.to_lowercase().contains("front") {
+        for (i, line) in content
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&content)
+            .lines()
+            .enumerate()
+        {
+            let parts = parse_csv_line(line);
+
+            // Skip header row (only when the first cell is the literal "front")
+            if i == 0
+                && parts
+                    .first()
+                    .map(|f| f.trim().eq_ignore_ascii_case("front"))
+                    .unwrap_or(false)
+            {
                 continue;
             }
 
-            let parts = parse_csv_line(line);
             if parts.len() >= 2 {
                 let front = parts[0].trim().to_string();
                 let back = parts[1].trim().to_string();
 
                 if !front.is_empty() && !back.is_empty() {
-                    deck.add_card(front, back);
+                    let card = deck.add_card(front, back);
+
+                    // Optional third column: tags (space separated)
+                    if parts.len() >= 3 {
+                        let tags: Vec<String> =
+                            parts[2].split_whitespace().map(|t| t.to_string()).collect();
+                        card.tags = tags;
+                    }
                 }
             }
         }
@@ -143,7 +167,7 @@ impl DeckStorage {
     /// Names decks based on filename, converting snake_case/kebab-case to Title Case.
     /// Skips any deck whose name already exists.
     /// Returns (imported, skipped) tuple.
-    pub fn import_folder(&self, folder_path: &Path) -> Result<(Vec<(String, usize)>, Vec<String>)> {
+    pub fn import_folder(&self, folder_path: &Path) -> Result<FolderImportResult> {
         let mut imported = Vec::new();
         let mut skipped = Vec::new();
 
@@ -158,7 +182,7 @@ impl DeckStorage {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().map_or(false, |e| e == "csv") {
+            if path.extension().is_some_and(|e| e == "csv") {
                 let deck_name = path
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -192,15 +216,21 @@ impl DeckStorage {
     /// Check if a deck with the given name already exists.
     pub fn deck_name_exists(&self, name: &str) -> bool {
         self.list_decks()
-            .map(|decks| decks.iter().any(|d| d.name.to_lowercase() == name.to_lowercase()))
+            .map(|decks| {
+                decks
+                    .iter()
+                    .any(|d| d.name.to_lowercase() == name.to_lowercase())
+            })
             .unwrap_or(false)
     }
 
     /// Import cards from an Anki text export (tab-separated or semicolon-separated).
     /// Format: front<TAB>back or front;back, with optional tags column.
     pub fn import_anki_text(&self, path: &Path, deck_name: &str) -> Result<Deck> {
-        let content = fs::read_to_string(path)
+        let raw = fs::read_to_string(path)
             .with_context(|| format!("Failed to read Anki text file: {:?}", path))?;
+        // Strip a UTF-8 BOM if present (common in Windows-exported files)
+        let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
 
         let mut deck = Deck::new(deck_name.to_string());
 
@@ -226,10 +256,8 @@ impl DeckStorage {
 
                     // If there's a third column, treat it as tags
                     if parts.len() >= 3 {
-                        let tags: Vec<String> = parts[2]
-                            .split_whitespace()
-                            .map(|t| t.to_string())
-                            .collect();
+                        let tags: Vec<String> =
+                            parts[2].split_whitespace().map(|t| t.to_string()).collect();
                         card.tags = tags;
                     }
 
@@ -247,11 +275,11 @@ impl DeckStorage {
         use rusqlite::Connection;
         use zip::ZipArchive;
 
-        let file = File::open(path)
-            .with_context(|| format!("Failed to open APKG file: {:?}", path))?;
+        let file =
+            File::open(path).with_context(|| format!("Failed to open APKG file: {:?}", path))?;
 
-        let mut archive = ZipArchive::new(file)
-            .with_context(|| "Failed to read APKG as ZIP archive")?;
+        let mut archive =
+            ZipArchive::new(file).with_context(|| "Failed to read APKG as ZIP archive")?;
 
         // Find and extract the SQLite database
         // Anki 2.1+ uses collection.anki21, older versions use collection.anki2
@@ -264,7 +292,8 @@ impl DeckStorage {
         };
 
         // Extract database to a temporary file
-        let mut db_file = archive.by_name(db_name)
+        let mut db_file = archive
+            .by_name(db_name)
             .with_context(|| format!("Failed to extract {} from APKG", db_name))?;
 
         let temp_dir = std::env::temp_dir();
@@ -277,8 +306,21 @@ impl DeckStorage {
         drop(temp_file);
 
         // Open the SQLite database
-        let conn = Connection::open(&temp_db_path)
-            .with_context(|| "Failed to open Anki database")?;
+        let conn =
+            Connection::open(&temp_db_path).with_context(|| "Failed to open Anki database")?;
+
+        // Collection creation date (UTC seconds) — Anki review-card due dates
+        // are day offsets counted from this date.
+        let crt_secs: i64 = {
+            let mut stmt = conn.prepare("SELECT crt FROM col")?;
+            stmt.query_row([], |row| row.get(0))
+                .with_context(|| "Failed to read collection creation date")?
+        };
+        let crt_date = chrono::DateTime::from_timestamp(crt_secs, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).date_naive())
+            .unwrap_or_else(|| chrono::Local::now().date_naive());
+        let today = chrono::Local::now().date_naive();
+        let days_since_crt = (today - crt_date).num_days();
 
         // Get deck names from the col table
         let deck_names: std::collections::HashMap<i64, String> = {
@@ -300,38 +342,76 @@ impl DeckStorage {
                 .unwrap_or_default()
         };
 
-        // Query notes and cards with scheduling info
-        // Join notes (for content) with cards (for scheduling and deck assignment)
+        // Query notes and cards with scheduling info.
+        // Join notes (content) with cards (scheduling, deck assignment) and
+        // keep only the first template (c.ord = 0) so multi-template note
+        // types (e.g. "Basic (and reversed card)") don't import duplicates.
         let mut stmt = conn.prepare(
-            "SELECT n.flds, c.did, c.ivl, c.factor, c.reps, c.lapses
+            "SELECT n.flds, n.tags, c.did, c.type, c.due, c.ivl, c.factor, c.reps, c.lapses
              FROM notes n
-             JOIN cards c ON c.nid = n.id"
+             JOIN cards c ON c.nid = n.id
+             WHERE c.ord = 0",
         )?;
 
         // Group cards by deck
-        let mut decks_map: std::collections::HashMap<i64, Vec<Card>> = std::collections::HashMap::new();
+        let mut decks_map: std::collections::HashMap<i64, Vec<Card>> =
+            std::collections::HashMap::new();
 
         let rows = stmt.query_map([], |row| {
             let flds: String = row.get(0)?;
-            let did: i64 = row.get(1)?;
-            let ivl: i32 = row.get(2)?;
-            let factor: i32 = row.get(3)?;
-            let reps: i32 = row.get(4)?;
-            let lapses: i32 = row.get(5)?;
-            Ok((flds, did, ivl, factor, reps, lapses))
+            let tags: String = row.get(1)?;
+            let did: i64 = row.get(2)?;
+            let card_type: i32 = row.get(3)?;
+            let due: i64 = row.get(4)?;
+            let ivl: i32 = row.get(5)?;
+            let factor: i32 = row.get(6)?;
+            let reps: i32 = row.get(7)?;
+            let lapses: i32 = row.get(8)?;
+            Ok((flds, tags, did, card_type, due, ivl, factor, reps, lapses))
         })?;
 
         for row in rows {
-            let (flds, did, ivl, factor, reps, lapses) = row?;
+            let (flds, tags, did, card_type, due, ivl, factor, reps, lapses) = row?;
 
             // Split fields by Anki's field separator (0x1f)
             let fields: Vec<&str> = flds.split('\x1f').collect();
-            if fields.len() < 2 {
+            if fields.is_empty() {
                 continue;
             }
 
-            let front = strip_html(fields[0]);
-            let back = strip_html(fields[1]);
+            // Field layout varies by note type: "Basic" is front=fields[0],
+            // back=fields[1], but multi-field templates (e.g. 成语 decks) keep
+            // the meaning in a later field, and cloze notes embed everything
+            // in fields[0]. Derive front/back accordingly instead of dying on
+            // an empty fields[1].
+            let (front, back) = if fields[0].contains("{{c") {
+                let answers = extract_cloze_answers(fields[0]);
+                let rest: Vec<&str> = fields[1..]
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let mut b = String::new();
+                if !answers.is_empty() {
+                    b.push_str(&format!("答案：{answers}"));
+                }
+                if !rest.is_empty() {
+                    if !b.is_empty() {
+                        b.push('\n');
+                    }
+                    b.push_str(&strip_html(&rest.join("\n")));
+                }
+                (strip_html(&cloze_blank(fields[0])), b)
+            } else {
+                let f = strip_html(fields[0]);
+                let b = fields[1..]
+                    .iter()
+                    .map(|s| s.trim())
+                    .find(|s| !s.is_empty())
+                    .map(strip_html)
+                    .unwrap_or_default();
+                (f, b)
+            };
 
             if front.is_empty() || back.is_empty() {
                 continue;
@@ -339,14 +419,32 @@ impl DeckStorage {
 
             // Create card with imported scheduling data
             let mut card = Card::new(front, back);
+            card.tags = tags.split_whitespace().map(|t| t.to_string()).collect();
             card.interval = ivl.max(0) as u32;
-            card.ease_factor = (factor as f64) / 1000.0;
+            // New/never-reviewed Anki cards store factor = 0, which would
+            // import as ease 0.00; fall back to the SM-2 default instead.
+            card.ease_factor = if factor >= 1300 {
+                (factor as f64) / 1000.0
+            } else {
+                2.5
+            };
             card.repetitions = reps.max(0) as u32;
             card.lapses = lapses.max(0) as u32;
 
-            // Set due date if card has been reviewed
-            if card.interval > 0 {
-                card.due_date = Some(chrono::Local::now() + chrono::Duration::days(card.interval as i64));
+            // Restore the due date according to Anki's per-type semantics:
+            //   type 0 = new          -> no due date (new card)
+            //   type 1/3 = (re)learning -> due is an epoch-seconds timestamp
+            //   type 2 = review       -> due is a day offset since col.crt
+            match card_type {
+                2 => {
+                    let days_until = due - days_since_crt;
+                    card.due_date = Some(chrono::Local::now() + chrono::Duration::days(days_until));
+                }
+                1 | 3 => {
+                    card.due_date = chrono::DateTime::from_timestamp(due.max(0), 0)
+                        .map(|dt| dt.with_timezone(&chrono::Local));
+                }
+                _ => {}
             }
 
             decks_map.entry(did).or_default().push(card);
@@ -478,6 +576,18 @@ impl DeckStorage {
 
         let now = chrono::Utc::now().timestamp();
         let now_millis = now * 1000;
+        // Anki convention: col.crt is the LOCAL midnight of the collection
+        // creation date, expressed as UTC seconds. Review-card due dates are
+        // day offsets from it, so using "now" here would shift every due
+        // date by up to a day across timezones.
+        let crt = chrono::Local::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .map(|dt| dt.timestamp())
+            .unwrap_or(now);
 
         // Build deck JSON for col table
         let mut decks_json = serde_json::Map::new();
@@ -579,7 +689,7 @@ impl DeckStorage {
         conn.execute(
             "INSERT INTO col VALUES (1, ?, ?, ?, 11, 0, -1, 0, '{}', ?, ?, ?, '{}')",
             rusqlite::params![
-                now,
+                crt,
                 now,
                 now_millis,
                 models_json.to_string(),
@@ -612,24 +722,29 @@ impl DeckStorage {
                     "INSERT INTO notes VALUES (?, ?, ?, ?, -1, ?, ?, ?, ?, 0, '')",
                     rusqlite::params![
                         note_id,
-                        &card.id,  // guid
+                        &card.id, // guid
                         model_id,
                         now,
                         tags,
                         flds,
-                        &card.front,  // sfld (sort field)
+                        &card.front, // sfld (sort field)
                         csum,
                     ],
                 )?;
 
                 // Determine card type and queue
                 let (card_type, queue, due) = if card.repetitions == 0 {
-                    (0, 0, note_id)  // New card
+                    (0, 0, note_id) // New card
                 } else if card.interval == 0 {
-                    (1, 1, now)  // Learning
+                    (1, 1, now) // Learning
                 } else {
-                    // Review card - due is days since collection creation
-                    let due_days = card.interval as i64;
+                    // Review card - due is a day offset counted from the
+                    // collection creation date (crt = today), so convert the
+                    // card's actual due date into that offset.
+                    let due_days = card
+                        .due_date
+                        .map(|d| (d.date_naive() - chrono::Local::now().date_naive()).num_days())
+                        .unwrap_or(card.interval as i64);
                     (2, 2, due_days)
                 };
 
@@ -662,8 +777,8 @@ impl DeckStorage {
             .with_context(|| format!("Failed to create APKG file: {:?}", path))?;
         let mut zip = ZipWriter::new(apkg_file);
 
-        let options = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
         // Add the database
         zip.start_file("collection.anki2", options)?;
@@ -709,9 +824,7 @@ impl DeckStorage {
                     let deck = self.import_anki_text(path, name)?;
                     Ok(vec![deck])
                 } else {
-                    anyhow::bail!(
-                        "Unknown file format. Expected .apkg, .txt, or .tsv file."
-                    )
+                    anyhow::bail!("Unknown file format. Expected .apkg, .txt, or .tsv file.")
                 }
             }
         }
@@ -754,10 +867,20 @@ fn parse_csv_line(line: &str) -> Vec<String> {
 
 /// Strip HTML tags from a string (basic implementation).
 fn strip_html(s: &str) -> String {
+    // Convert line-break and block-closing tags to newlines BEFORE stripping,
+    // otherwise the tag stripper would swallow them and lose all line breaks.
+    let lowered_breaks = s
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</p>", "\n")
+        .replace("</div>", "\n")
+        .replace("</li>", "\n");
+
     let mut result = String::new();
     let mut in_tag = false;
 
-    for c in s.chars() {
+    for c in lowered_breaks.chars() {
         match c {
             '<' => in_tag = true,
             '>' => in_tag = false,
@@ -766,7 +889,7 @@ fn strip_html(s: &str) -> String {
         }
     }
 
-    // Also decode common HTML entities
+    // Decode common HTML entities
     result
         .replace("&nbsp;", " ")
         .replace("&amp;", "&")
@@ -774,23 +897,100 @@ fn strip_html(s: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br />", "\n")
         .trim()
         .to_string()
 }
 
+/// One `{{cN::text(::hint)?}}` occurrence inside a cloze note.
+struct ClozeHit {
+    start: usize,
+    end: usize,
+    n: u32,
+    text: String,
+    hint: Option<String>,
+}
+
+/// Find all cloze deletions in a note body (hand-rolled scan; no regex dep).
+fn find_cloze_hits(s: &str) -> Vec<ClozeHit> {
+    let bytes = s.as_bytes();
+    let mut hits = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'{' && bytes[i + 1] == b'{' {
+            if let Some(rel) = s[i + 2..].find("}}") {
+                let inner = &s[i + 2..i + 2 + rel];
+                let after_c = inner.strip_prefix('c').unwrap_or("");
+                let mut it = after_c.splitn(2, "::");
+                let num = it.next().unwrap_or("");
+                if let Ok(n) = num.parse::<u32>() {
+                    let tail = it.next().unwrap_or("");
+                    let mut parts = tail.splitn(2, "::");
+                    let text = parts.next().unwrap_or("").trim().to_string();
+                    let hint = parts
+                        .next()
+                        .map(|h| h.trim().to_string())
+                        .filter(|h| !h.is_empty());
+                    hits.push(ClozeHit {
+                        start: i,
+                        end: i + 2 + rel + 2,
+                        n,
+                        text,
+                        hint,
+                    });
+                    i += 2 + rel + 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    hits
+}
+
+/// Blank out the `{{c1::…}}` deletions of a cloze note for use as a question
+/// (hint kept in brackets); other cloze numbers render as plain text, matching
+/// Anki's first-template rendering.
+fn cloze_blank(s: &str) -> String {
+    let mut out = String::new();
+    let mut last = 0;
+    for h in find_cloze_hits(s) {
+        out.push_str(&s[last..h.start]);
+        if h.n == 1 {
+            match &h.hint {
+                Some(hint) => out.push_str(&format!("［{hint}］")),
+                None => out.push_str("＿＿＿"),
+            }
+        } else {
+            out.push_str(&h.text);
+        }
+        last = h.end;
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// Collect the answers of all `{{c1::…}}` deletions, joined by "；".
+fn extract_cloze_answers(s: &str) -> String {
+    let answers: Vec<String> = find_cloze_hits(s)
+        .into_iter()
+        .filter(|h| h.n == 1)
+        .map(|h| h.text)
+        .filter(|t| !t.is_empty())
+        .collect();
+    answers.join("；")
+}
+
 /// Convert a filename (snake_case or kebab-case) to Title Case.
 fn filename_to_title_case(name: &str) -> String {
-    name.split(|c| c == '_' || c == '-')
+    name.split(['_', '-'])
         .filter(|s| !s.is_empty())
         .map(|word| {
             let mut chars = word.chars();
             match chars.next() {
                 None => String::new(),
                 Some(first) => {
-                    first.to_uppercase().collect::<String>() + chars.as_str().to_lowercase().as_str()
+                    first.to_uppercase().collect::<String>()
+                        + chars.as_str().to_lowercase().as_str()
                 }
             }
         })
@@ -804,7 +1004,6 @@ pub struct DeckInfo {
     pub id: String,
     pub name: String,
     pub card_count: usize,
-    pub description: String,
 }
 
 /// Backup format containing all decks.
@@ -814,6 +1013,9 @@ pub struct Backup {
     pub created_at: chrono::DateTime<chrono::Local>,
     pub decks: Vec<Deck>,
 }
+
+/// Decks imported from a folder: (imported (name, card count), skipped names).
+pub type FolderImportResult = (Vec<(String, usize)>, Vec<String>);
 
 impl DeckStorage {
     /// Export all decks to a backup file.
@@ -845,11 +1047,8 @@ impl DeckStorage {
         let json = fs::read_to_string(path)?;
         let backup: Backup = serde_json::from_str(&json)?;
 
-        let existing_ids: std::collections::HashSet<String> = self
-            .list_decks()?
-            .into_iter()
-            .map(|d| d.id)
-            .collect();
+        let existing_ids: std::collections::HashSet<String> =
+            self.list_decks()?.into_iter().map(|d| d.id).collect();
 
         let mut imported = 0;
         let mut skipped = 0;
@@ -873,5 +1072,303 @@ impl DeckStorage {
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."))
             .join(format!("srl_backup_{}.json", timestamp))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ReviewRating;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("srl_test_{}_{}", tag, uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Drop an (invalid) .json placeholder into a fresh storage dir so
+    /// install_bundled_decks() skips seeding the bundled deck — it would
+    /// otherwise pollute deck-count and export assertions.
+    fn suppress_bundled_deck(dir: &Path) {
+        fs::write(dir.join(".placeholder.json"), "{}").unwrap();
+    }
+
+    // ── parse_csv_line ──────────────────────────────────────────────────
+
+    #[test]
+    fn csv_plain_fields() {
+        assert_eq!(parse_csv_line("a,b"), vec!["a", "b"]);
+        assert_eq!(parse_csv_line("a,b,c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn csv_quoted_commas_and_escapes() {
+        assert_eq!(parse_csv_line(r#""a,b",c"#), vec!["a,b", "c"]);
+        assert_eq!(
+            parse_csv_line(r#""say ""hi""",b"#),
+            vec![r#"say "hi""#, "b"]
+        );
+        // A quoted field containing "front" is data, not a header
+        assert_eq!(
+            parse_csv_line(r#""the front",back"#),
+            vec!["the front", "back"]
+        );
+    }
+
+    // ── strip_html ──────────────────────────────────────────────────────
+
+    #[test]
+    fn br_tags_become_newlines() {
+        assert_eq!(strip_html("Hello<br>World"), "Hello\nWorld");
+        assert_eq!(strip_html("Hello<br/>World"), "Hello\nWorld");
+        assert_eq!(strip_html("Hello<br />World"), "Hello\nWorld");
+        assert_eq!(strip_html("<p>One</p><p>Two</p>"), "One\nTwo");
+    }
+
+    #[test]
+    fn tags_stripped_entities_decoded() {
+        assert_eq!(strip_html("<b>bold</b>"), "bold");
+        assert_eq!(strip_html("a &amp; b &lt;c&gt;"), "a & b <c>");
+        assert_eq!(strip_html("x&nbsp;y"), "x y");
+    }
+
+    // ── cloze handling (AnkiWeb 【高考╳Anki】 decks) ─────────────────────
+
+    #[test]
+    fn cloze_blank_and_answers() {
+        let s = "{{c1::伽利略}}在比萨斜塔做了实验，提出{{c2::三条}}{{c1::运动定律}}";
+        // c1 blanks out, c2 renders as plain text (first-template rendering)
+        assert_eq!(cloze_blank(s), "＿＿＿在比萨斜塔做了实验，提出三条＿＿＿");
+        assert_eq!(extract_cloze_answers(s), "伽利略；运动定律");
+    }
+
+    #[test]
+    fn cloze_hint_shows_in_blank() {
+        let s = "质量是{{c1::物体::对象的}}固有属性";
+        assert_eq!(cloze_blank(s), "质量是［对象的］固有属性");
+        assert_eq!(extract_cloze_answers(s), "物体");
+    }
+
+    #[test]
+    fn multi_field_note_uses_first_nonempty_back() {
+        // 成语-style template: field1 empty, field2 holds the meaning
+        let flds = "安土重迁\u{1f}\u{1f}重迁，把搬迁看得很重。\u{1f}\u{1f}\u{1f}\u{1f}";
+        let fields: Vec<&str> = flds.split('\u{1f}').collect();
+        let back = fields[1..]
+            .iter()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())
+            .unwrap_or_default();
+        assert_eq!(back, "重迁，把搬迁看得很重。");
+    }
+
+    // ── filename_to_title_case ──────────────────────────────────────────
+
+    #[test]
+    fn filenames_to_title_case() {
+        assert_eq!(filename_to_title_case("spanish_vocab"), "Spanish Vocab");
+        assert_eq!(filename_to_title_case("gre-hard-words"), "Gre Hard Words");
+        assert_eq!(filename_to_title_case("trailing_"), "Trailing");
+    }
+
+    // ── import_csv ──────────────────────────────────────────────────────
+
+    #[test]
+    fn csv_import_header_bom_quotes_and_tags() {
+        let dir = temp_dir("csv");
+        let path = dir.join("cards.csv");
+        fs::write(
+            &path,
+            "\u{feff}front,back,tags\n\
+             \"What is 2+2?\",\"Four\",math easy\n\
+             What is 2+3?,Five,\n\
+             \n\
+             onlyfront,\n",
+        )
+        .unwrap();
+
+        let storage = DeckStorage::new(dir.clone()).unwrap();
+        let deck = storage.import_csv(&path, "T").unwrap();
+
+        assert_eq!(deck.cards.len(), 2, "header/blank/empty-back rows skipped");
+        assert_eq!(deck.cards[0].front, "What is 2+2?");
+        assert_eq!(deck.cards[0].back, "Four");
+        assert_eq!(deck.cards[0].tags, vec!["math", "easy"]);
+        assert_eq!(deck.cards[1].back, "Five");
+        assert!(deck.cards[1].tags.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn csv_import_first_row_with_front_word_is_data() {
+        let dir = temp_dir("csv2");
+        let path = dir.join("cards.csv");
+        fs::write(&path, "the front side,answer\n").unwrap();
+
+        let storage = DeckStorage::new(dir.clone()).unwrap();
+        let deck = storage.import_csv(&path, "T").unwrap();
+        assert_eq!(deck.cards.len(), 1, "not misdetected as a header row");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── import_anki_text ────────────────────────────────────────────────
+
+    #[test]
+    fn anki_text_tab_semicolon_and_tags() {
+        let dir = temp_dir("txt");
+        let path = dir.join("vocab.txt");
+        fs::write(
+            &path,
+            "hola\thello\tspanish basic\nbonjour;hello\n\n# comment\n",
+        )
+        .unwrap();
+
+        let storage = DeckStorage::new(dir.clone()).unwrap();
+        let deck = storage.import_anki_text(&path, "V").unwrap();
+
+        assert_eq!(deck.cards.len(), 2);
+        assert_eq!(deck.cards[0].front, "hola");
+        assert_eq!(deck.cards[0].tags, vec!["spanish", "basic"]);
+        assert_eq!(deck.cards[1].front, "bonjour");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── apkg export → import roundtrip ─────────────────────────────────
+
+    #[test]
+    fn apkg_roundtrip_preserves_content_and_scheduling() {
+        let src_dir = temp_dir("apkg_src");
+        let dst_dir = temp_dir("apkg_dst");
+        suppress_bundled_deck(&src_dir);
+
+        let storage = DeckStorage::new(src_dir.clone()).unwrap();
+        let mut deck = Deck::new("Roundtrip".into());
+        deck.add_card("Front A".into(), "Back A".into());
+        let studied = deck.add_card("Front B".into(), "Back B<br>line2".into());
+        studied.interval = 10;
+        studied.ease_factor = 2.6;
+        studied.repetitions = 3;
+        studied.lapses = 1;
+        studied.total_reviews = 5;
+        studied.due_date = Some(chrono::Local::now() + chrono::Duration::days(10));
+        studied.last_reviewed = Some(chrono::Local::now() - chrono::Duration::days(1));
+        studied.tags = vec!["geo".into()];
+        storage.save_deck(&deck).unwrap();
+
+        let apkg = src_dir.join("out.apkg");
+        let exported = storage.export_apkg(&apkg, None).unwrap();
+        assert_eq!(exported, 2);
+
+        let dst = DeckStorage::new(dst_dir.clone()).unwrap();
+        let decks = dst.import_apkg(&apkg).unwrap();
+        assert_eq!(decks.len(), 1);
+        assert_eq!(decks[0].name, "Roundtrip");
+        assert_eq!(decks[0].cards.len(), 2);
+
+        // Content, including restored line breaks from <br>
+        assert_eq!(decks[0].cards[0].front, "Front A");
+        assert_eq!(decks[0].cards[1].back, "Back B\nline2");
+        assert_eq!(decks[0].cards[1].tags, vec!["geo"]);
+
+        // Scheduling
+        let b = &decks[0].cards[1];
+        assert_eq!(b.interval, 10);
+        assert!((b.ease_factor - 2.6).abs() < 1e-9);
+        assert_eq!(b.repetitions, 3);
+        assert_eq!(b.lapses, 1);
+        // Due date should still be ~10 days out (not now + 10 days + elapsed)
+        let days = (b.due_date.unwrap() - chrono::Local::now()).num_days();
+        assert!(
+            (9..=11).contains(&days),
+            "due in ~10 days, got {} days",
+            days
+        );
+
+        // A never-studied card keeps the default ease (Anki stores factor=0)
+        assert!((decks[0].cards[0].ease_factor - 2.5).abs() < 1e-9);
+        assert!(decks[0].cards[0].due_date.is_none());
+        assert!(decks[0].cards[0].is_new());
+
+        let _ = fs::remove_dir_all(&src_dir);
+        let _ = fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn apkg_import_overdue_review_card_is_due_now() {
+        let src_dir = temp_dir("apkg_overdue_src");
+        let dst_dir = temp_dir("apkg_overdue_dst");
+        suppress_bundled_deck(&src_dir);
+
+        let storage = DeckStorage::new(src_dir.clone()).unwrap();
+        let mut deck = Deck::new("Overdue".into());
+        let c = deck.add_card("F".into(), "B".into());
+        c.interval = 7;
+        c.repetitions = 2;
+        c.total_reviews = 3;
+        c.due_date = Some(chrono::Local::now() - chrono::Duration::days(3)); // overdue
+        storage.save_deck(&deck).unwrap();
+
+        let apkg = src_dir.join("o.apkg");
+        storage.export_apkg(&apkg, None).unwrap();
+
+        let dst = DeckStorage::new(dst_dir.clone()).unwrap();
+        let decks = dst.import_apkg(&apkg).unwrap();
+        assert_eq!(decks[0].cards.len(), 1);
+        assert!(
+            decks[0].cards[0].is_due(),
+            "overdue card must be due after import"
+        );
+
+        let _ = fs::remove_dir_all(&src_dir);
+        let _ = fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn backup_roundtrip_and_duplicate_skip() {
+        let src_dir = temp_dir("bk_src");
+        let dst_dir = temp_dir("bk_dst");
+        suppress_bundled_deck(&src_dir);
+        suppress_bundled_deck(&dst_dir);
+
+        let s1 = DeckStorage::new(src_dir.clone()).unwrap();
+        let mut deck = Deck::new("BK".into());
+        deck.add_card("f".into(), "b".into());
+        s1.save_deck(&deck).unwrap();
+
+        let backup = src_dir.join("bk.json");
+        assert_eq!(s1.export_backup(&backup).unwrap(), 1);
+
+        let s2 = DeckStorage::new(dst_dir.clone()).unwrap();
+        assert_eq!(s2.import_backup(&backup).unwrap(), (1, 0));
+        // Importing again: same deck id → skipped
+        assert_eq!(s2.import_backup(&backup).unwrap(), (0, 1));
+        assert_eq!(s2.list_decks().unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(&src_dir);
+        let _ = fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn saving_preserves_review_state() {
+        let dir = temp_dir("save");
+        let storage = DeckStorage::new(dir.clone()).unwrap();
+        let mut deck = Deck::new("S".into());
+        let id = deck.add_card("f".into(), "b".into()).id.clone();
+        storage.save_deck(&deck).unwrap();
+
+        let mut loaded = storage.load_deck(&deck.id).unwrap().unwrap();
+        let card = loaded.cards.iter_mut().find(|c| c.id == id).unwrap();
+        crate::sm2::Scheduler::new().review_card(card, ReviewRating::Good);
+        storage.save_deck(&loaded).unwrap();
+
+        let reloaded = storage.load_deck(&deck.id).unwrap().unwrap();
+        assert_eq!(reloaded.cards[0].total_reviews, 1);
+        assert_eq!(reloaded.cards[0].interval, 1);
+        assert!(!reloaded.cards[0].is_new());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

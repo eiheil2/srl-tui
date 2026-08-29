@@ -14,71 +14,75 @@ use super::theme::Theme;
 use crate::models::DeckStats;
 
 // ══════════════════════════════════════════════════════════════════════════
-// Logo Widget
+// Header Bar Widget
 // ══════════════════════════════════════════════════════════════════════════
 
-pub struct Logo<'a> {
+/// Slim top bar: accent diamond + bold title on the left, dim context info
+/// right-aligned, with a full-width hairline rule underneath.
+pub struct HeaderBar<'a> {
     theme: &'a Theme,
+    title: &'a str,
+    context: &'a str,
 }
 
-impl<'a> Logo<'a> {
-    const ART: &'static str = r#"
-  ███████╗██████╗ ██╗
-  ██╔════╝██╔══██╗██║
-  ███████╗██████╔╝██║
-  ╚════██║██╔══██╗██║
-  ███████║██║  ██║███████╗
-  ╚══════╝╚═╝  ╚═╝╚══════╝"#;
-
-    const SUBTITLE: &'static str = "spaced  repetition  learning";
-
-    pub fn new(theme: &'a Theme) -> Self {
-        Self { theme }
-    }
-
-    pub fn render_to(theme: &Theme, area: Rect, buf: &mut Buffer) {
-        // Split area for logo and subtitle
-        let chunks = Layout::vertical([
-            Constraint::Length(6), // ASCII art
-            Constraint::Length(1), // spacing
-            Constraint::Length(1), // subtitle
-        ])
-        .split(area);
-
-        // Render ASCII art - pad all lines to same width so centering aligns them
-        let art_lines: Vec<&str> = Self::ART.lines().skip(1).collect();
-        let max_width = art_lines.iter().map(|l| l.width()).max().unwrap_or(0);
-
-        let lines: Vec<Line> = art_lines
-            .iter()
-            .map(|line| {
-                // Pad line to max_width so all lines center to the same position
-                let line_width = line.width();
-                let padding = max_width.saturating_sub(line_width);
-                let padded = format!("{}{}", line, " ".repeat(padding));
-                Line::from(vec![
-                    Span::styled(padded, Style::default().fg(theme.colors.primary))
-                ])
-            })
-            .collect();
-
-        let para = Paragraph::new(lines)
-            .alignment(Alignment::Center);
-        para.render(chunks[0], buf);
-
-        // Render subtitle
-        let subtitle = Paragraph::new(Span::styled(
-            Self::SUBTITLE,
-            Style::default().fg(theme.colors.text_muted),
-        ))
-        .alignment(Alignment::Center);
-        subtitle.render(chunks[2], buf);
+impl<'a> HeaderBar<'a> {
+    pub fn new(theme: &'a Theme, title: &'a str, context: &'a str) -> Self {
+        Self {
+            theme,
+            title,
+            context,
+        }
     }
 }
 
-impl Widget for Logo<'_> {
+impl Widget for HeaderBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        Self::render_to(self.theme, area, buf);
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+
+        let row = Rect { height: 1, ..area };
+
+        let left = Line::from(vec![
+            Span::styled("◆ ", Style::default().fg(self.theme.colors.accent)),
+            Span::styled(
+                self.title.to_string(),
+                Style::default()
+                    .fg(self.theme.colors.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        Paragraph::new(left).render(row, buf);
+
+        if !self.context.is_empty() {
+            let title_w = 2 + UnicodeWidthStr::width(self.title);
+            let ctx_w = UnicodeWidthStr::width(self.context);
+            // Only right-align when both halves fit without overlapping
+            if title_w + ctx_w + 2 <= area.width as usize {
+                Paragraph::new(Span::styled(
+                    self.context.to_string(),
+                    Style::default().fg(self.theme.colors.text_dim),
+                ))
+                .alignment(Alignment::Right)
+                .render(row, buf);
+            }
+        }
+
+        // Hairline rule
+        if area.height >= 2 {
+            let rule = Line::from(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default().fg(self.theme.colors.text_dim),
+            ));
+            Paragraph::new(rule).render(
+                Rect {
+                    y: area.y + 1,
+                    height: 1,
+                    ..area
+                },
+                buf,
+            );
+        }
     }
 }
 
@@ -111,10 +115,7 @@ impl Widget for StatsBar<'_> {
         let new_text = Line::from(vec![
             Span::styled("● ", self.theme.stats_new()),
             Span::styled("New: ", Style::default().fg(self.theme.colors.text_muted)),
-            Span::styled(
-                self.stats.new_cards.to_string(),
-                self.theme.stats_new(),
-            ),
+            Span::styled(self.stats.new_cards.to_string(), self.theme.stats_new()),
         ]);
         Paragraph::new(new_text)
             .alignment(Alignment::Center)
@@ -123,7 +124,10 @@ impl Widget for StatsBar<'_> {
         // Learning cards
         let learning_text = Line::from(vec![
             Span::styled("● ", self.theme.stats_learning()),
-            Span::styled("Learning: ", Style::default().fg(self.theme.colors.text_muted)),
+            Span::styled(
+                "Learning: ",
+                Style::default().fg(self.theme.colors.text_muted),
+            ),
             Span::styled(
                 self.stats.learning_cards.to_string(),
                 self.theme.stats_learning(),
@@ -137,10 +141,7 @@ impl Widget for StatsBar<'_> {
         let due_text = Line::from(vec![
             Span::styled("● ", self.theme.stats_due()),
             Span::styled("Due: ", Style::default().fg(self.theme.colors.text_muted)),
-            Span::styled(
-                self.stats.due_cards.to_string(),
-                self.theme.stats_due(),
-            ),
+            Span::styled(self.stats.due_cards.to_string(), self.theme.stats_due()),
         ]);
         Paragraph::new(due_text)
             .alignment(Alignment::Center)
@@ -172,23 +173,27 @@ pub struct FlashcardWidget<'a> {
 
 impl<'a> FlashcardWidget<'a> {
     pub fn new(content: &'a str, is_front: bool, theme: &'a Theme) -> Self {
-        Self { content, is_front, theme }
+        Self {
+            content,
+            is_front,
+            theme,
+        }
     }
 }
 
 impl Widget for FlashcardWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let (label, label_style, border_style) = if self.is_front {
-            ("QUESTION", self.theme.card_front(), Style::default().fg(self.theme.colors.accent))
+        let (label, label_style) = if self.is_front {
+            ("QUESTION", self.theme.card_front())
         } else {
-            ("ANSWER", self.theme.card_back(), Style::default().fg(self.theme.colors.success))
+            ("ANSWER", self.theme.card_back())
         };
 
-        // Outer block with pretty border
+        // Quiet border; the label carries the color
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(border_style)
+            .border_style(Style::default().fg(self.theme.colors.text_dim))
             .title(Line::from(vec![
                 Span::raw(" "),
                 Span::styled(label, label_style),
@@ -205,7 +210,7 @@ impl Widget for FlashcardWidget<'_> {
         // Build lines from content, handling explicit newlines
         // Cap width at 70 chars for readability on wide terminals
         let available_width = inner.width.saturating_sub(4) as usize;
-        let content_width = available_width.min(70).max(20);
+        let content_width = available_width.min(70);
         let mut all_lines: Vec<Line> = Vec::new();
 
         if content_width > 0 {
@@ -264,8 +269,16 @@ pub struct RatingButtons<'a> {
 }
 
 impl<'a> RatingButtons<'a> {
-    pub fn new(intervals: &'a [(crate::models::ReviewRating, String)], enabled: bool, theme: &'a Theme) -> Self {
-        Self { intervals, enabled, theme }
+    pub fn new(
+        intervals: &'a [(crate::models::ReviewRating, String)],
+        enabled: bool,
+        theme: &'a Theme,
+    ) -> Self {
+        Self {
+            intervals,
+            enabled,
+            theme,
+        }
     }
 }
 
@@ -280,62 +293,43 @@ impl Widget for RatingButtons<'_> {
         .split(area);
 
         for (i, (rating, interval)) in self.intervals.iter().enumerate() {
+            let col = chunks[i];
+            // Layout may collapse columns to zero height on tiny terminals;
+            // rendering into out-of-bounds rows would panic.
+            if col.height == 0 || col.width == 0 {
+                continue;
+            }
             let color = if self.enabled {
                 rating.color_for_theme(self.theme)
             } else {
                 self.theme.colors.text_dim
             };
 
-            let key = (i + 1).to_string();
-            let name = rating.name();
-
-            let button = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(color));
-
-            let inner = button.inner(chunks[i]);
-            button.render(chunks[i], buf);
-
-            // Key number
+            // Borderless column: "1  Again" with the interval below
             let key_line = Line::from(vec![
-                Span::styled(&key, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    (i + 1).to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ", Style::default().fg(color)),
+                Span::styled(rating.name(), Style::default().fg(color)),
             ]);
             Paragraph::new(key_line)
                 .alignment(Alignment::Center)
-                .render(
-                    Rect {
-                        y: inner.y,
-                        ..inner
-                    },
-                    buf,
-                );
+                .render(Rect { height: 1, ..col }, buf);
 
-            // Rating name
-            let name_line = Line::from(vec![
-                Span::styled(name, Style::default().fg(color)),
-            ]);
-            Paragraph::new(name_line)
-                .alignment(Alignment::Center)
-                .render(
-                    Rect {
-                        y: inner.y + 1,
-                        ..inner
-                    },
-                    buf,
-                );
-
-            // Interval
-            if self.enabled {
-                let interval_line = Line::from(vec![
-                    Span::styled(interval, Style::default().fg(self.theme.colors.text_muted)),
-                ]);
+            if self.enabled && !interval.is_empty() && col.height >= 2 {
+                let interval_line = Line::from(Span::styled(
+                    interval.as_str(),
+                    Style::default().fg(self.theme.colors.text_dim),
+                ));
                 Paragraph::new(interval_line)
                     .alignment(Alignment::Center)
                     .render(
                         Rect {
-                            y: inner.y + 2,
-                            ..inner
+                            y: col.y + 1,
+                            height: 1,
+                            ..col
                         },
                         buf,
                     );
@@ -369,14 +363,16 @@ impl Widget for KeyHints<'_> {
         let mut current_width: usize = 0;
 
         for (i, (key, desc)) in self.hints.iter().enumerate() {
-            // Width: key + " " + desc + " " + "│ " (or nothing for last item)
-            let hint_width = key.len() + 1 + desc.len() + 1 + if i < self.hints.len() - 1 { 2 } else { 0 };
+            // Width: key + " " + desc + " " + "· " (or nothing for last item)
+            let key_w = UnicodeWidthStr::width(*key);
+            let desc_w = UnicodeWidthStr::width(*desc);
+            let hint_width = key_w + 1 + desc_w + 1 + if i < self.hints.len() - 1 { 2 } else { 0 };
 
             // Check if this hint fits on current line
             if current_width + hint_width > available_width && !current_line.is_empty() {
                 // Remove trailing separator from current line
                 if let Some(last) = current_line.last() {
-                    if last.content.contains('│') {
+                    if last.content.contains('·') {
                         current_line.pop();
                     }
                 }
@@ -388,7 +384,10 @@ impl Widget for KeyHints<'_> {
             current_line.push(Span::styled(*key, self.theme.key_highlight()));
             current_line.push(Span::styled(format!(" {} ", desc), self.theme.key_hint()));
             if i < self.hints.len() - 1 {
-                current_line.push(Span::styled("│ ", Style::default().fg(self.theme.colors.text_dim)));
+                current_line.push(Span::styled(
+                    "· ",
+                    Style::default().fg(self.theme.colors.text_dim),
+                ));
             }
             current_width += hint_width;
         }
@@ -440,7 +439,7 @@ impl Widget for CompletionScreen<'_> {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(self.theme.colors.success))
+            .border_style(Style::default().fg(self.theme.colors.text_dim))
             .title(Line::from(vec![
                 Span::raw(" "),
                 Span::styled("SESSION COMPLETE", self.theme.card_back()),
@@ -453,29 +452,42 @@ impl Widget for CompletionScreen<'_> {
 
         let text = vec![
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Great job!", Style::default().fg(self.theme.colors.success).add_modifier(Modifier::BOLD)),
-            ]),
+            Line::from(vec![Span::styled(
+                "Great job!",
+                Style::default()
+                    .fg(self.theme.colors.success)
+                    .add_modifier(Modifier::BOLD),
+            )]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("Cards studied: ", Style::default().fg(self.theme.colors.text_muted)),
+                Span::styled(
+                    "Cards studied: ",
+                    Style::default().fg(self.theme.colors.text_muted),
+                ),
                 Span::styled(
                     self.cards_studied.to_string(),
-                    Style::default().fg(self.theme.colors.primary).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(self.theme.colors.primary)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
                 Span::styled("Time: ", Style::default().fg(self.theme.colors.text_muted)),
                 Span::styled(
                     format!("{} minutes", self.duration_mins),
-                    Style::default().fg(self.theme.colors.primary).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(self.theme.colors.primary)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(""),
             Line::from(vec![
                 Span::styled("Press ", Style::default().fg(self.theme.colors.text_dim)),
                 Span::styled("ESC", self.theme.key_highlight()),
-                Span::styled(" to return", Style::default().fg(self.theme.colors.text_dim)),
+                Span::styled(
+                    " to return",
+                    Style::default().fg(self.theme.colors.text_dim),
+                ),
             ]),
         ];
 

@@ -14,12 +14,12 @@ Thank you for your interest in contributing to SRL! This document provides guide
 1. Fork the repository on GitHub
 2. Clone your fork:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/flashcards.git
-   cd flashcards
+   git clone https://github.com/YOUR_USERNAME/srl-tui.git
+   cd srl-tui
    ```
 3. Add the upstream remote:
    ```bash
-   git remote add upstream https://github.com/kearnsw/flashcards.git
+   git remote add upstream https://github.com/eiheil2/srl-tui.git
    ```
 4. Build the project:
    ```bash
@@ -105,7 +105,7 @@ cargo run
 ## Project Structure
 
 ```
-flashcards/
+srl-tui/
 ├── src/
 │   ├── main.rs        # Entry point, CLI handling
 │   ├── models.rs      # Card, Deck, and related types

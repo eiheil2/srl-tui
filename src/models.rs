@@ -33,16 +33,6 @@ impl ReviewRating {
         }
     }
 
-    pub fn color(&self) -> ratatui::style::Color {
-        use ratatui::style::Color;
-        match self {
-            Self::Again => Color::Red,
-            Self::Hard => Color::Yellow,
-            Self::Good => Color::Blue,
-            Self::Easy => Color::Green,
-        }
-    }
-
     pub fn color_for_theme(&self, theme: &crate::ui::theme::Theme) -> ratatui::style::Color {
         match self {
             Self::Again => theme.colors.rating_again,
@@ -100,8 +90,11 @@ impl Card {
         }
     }
 
+    /// A card is "new" only if it has never been studied. A lapsed card also
+    /// has `repetitions == 0` (SM-2 resets it on failure), but it must not be
+    /// counted as new or re-queued through the new-card batch.
     pub fn is_new(&self) -> bool {
-        self.repetitions == 0
+        self.repetitions == 0 && self.total_reviews == 0
     }
 
     pub fn is_due(&self) -> bool {
@@ -158,18 +151,10 @@ impl Deck {
         }
     }
 
-    pub fn add_card(&mut self, front: String, back: String) -> &Card {
+    pub fn add_card(&mut self, front: String, back: String) -> &mut Card {
         let card = Card::new(front, back);
         self.cards.push(card);
-        self.cards.last().unwrap()
-    }
-
-    pub fn get_due_cards(&self) -> Vec<&Card> {
-        self.cards.iter().filter(|c| c.is_due()).collect()
-    }
-
-    pub fn get_new_cards(&self) -> Vec<&Card> {
-        self.cards.iter().filter(|c| c.is_new()).collect()
+        self.cards.last_mut().unwrap()
     }
 
     pub fn get_stats(&self) -> DeckStats {
@@ -211,5 +196,93 @@ impl Deck {
         let len_before = self.cards.len();
         self.cards.retain(|c| c.id != card_id);
         self.cards.len() < len_before
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn only_never_studied_cards_are_new() {
+        let mut c = Card::new("f".into(), "b".into());
+        assert!(c.is_new());
+
+        // Lapsed card: SM-2 resets repetitions to 0 on failure, but the card
+        // has review history and must not be counted as new.
+        c.total_reviews = 3;
+        c.repetitions = 0;
+        assert!(!c.is_new());
+    }
+
+    #[test]
+    fn card_without_due_date_is_due() {
+        let c = Card::new("f".into(), "b".into());
+        assert!(c.is_due());
+    }
+
+    #[test]
+    fn stats_counting() {
+        let mut deck = Deck::new("d".into());
+
+        // New card
+        deck.add_card("q1".into(), "a1".into());
+
+        // Mature card, not due
+        let mature = deck.add_card("q2".into(), "a2".into());
+        mature.interval = 30;
+        mature.repetitions = 2;
+        mature.total_reviews = 5;
+        mature.due_date = Some(Local::now() + Duration::days(30));
+        mature.last_reviewed = Some(Local::now() - Duration::days(1));
+
+        // Learning card, overdue
+        let learning = deck.add_card("q3".into(), "a3".into());
+        learning.interval = 5;
+        learning.repetitions = 1;
+        learning.total_reviews = 2;
+        learning.due_date = Some(Local::now() - Duration::days(1));
+        learning.last_reviewed = Some(Local::now() - Duration::days(6));
+
+        let stats = deck.get_stats();
+        assert_eq!(stats.total_cards, 3);
+        assert_eq!(stats.new_cards, 1);
+        assert_eq!(stats.due_cards, 1);
+        assert_eq!(stats.learning_cards, 1);
+        assert_eq!(stats.mature_cards, 1);
+    }
+
+    #[test]
+    fn update_and_delete_card_by_id() {
+        let mut deck = Deck::new("d".into());
+        let c = deck.add_card("q".into(), "a".into());
+        let id = c.id.clone();
+
+        assert!(deck.update_card(&id, "q2".into(), "a2".into()));
+        assert_eq!(deck.cards[0].front, "q2");
+
+        assert!(deck.delete_card(&id));
+        assert!(deck.cards.is_empty());
+        assert!(!deck.delete_card(&id));
+    }
+
+    #[test]
+    fn reset_progress_restores_fresh_state() {
+        let mut c = Card::new("f".into(), "b".into());
+        c.interval = 42;
+        c.repetitions = 5;
+        c.ease_factor = 1.9;
+        c.total_reviews = 10;
+        c.lapses = 2;
+        c.due_date = Some(Local::now());
+        c.reset_progress();
+
+        assert!(c.is_new());
+        assert!(c.is_due());
+        assert_eq!(c.interval, 0);
+        assert_eq!(c.ease_factor, 2.5);
+        assert_eq!(c.total_reviews, 0);
+        assert_eq!(c.lapses, 0);
     }
 }

@@ -14,6 +14,8 @@ A beautiful, fast spaced repetition flashcard app for the terminal.
 
 Built with [Ratatui](https://ratatui.rs) for a modern TUI experience.
 
+📖 **[使用教程（中文）](TUTORIAL.md)** — 安装、导入卡组、日常学习、备份全流程。
+
 ## Features
 
 - **SM-2 Spaced Repetition** - Optimal review scheduling based on recall quality
@@ -27,18 +29,11 @@ Built with [Ratatui](https://ratatui.rs) for a modern TUI experience.
 
 ## Installation
 
-### Homebrew (macOS)
-
-```bash
-brew tap kearnsw/tap
-brew install srl
-```
-
 ### From Source
 
 ```bash
-git clone https://github.com/kearnsw/flashcards.git
-cd flashcards
+git clone https://github.com/eiheil2/srl-tui.git
+cd srl-tui
 cargo install --path .
 ```
 
@@ -47,6 +42,9 @@ cargo install --path .
 ```bash
 # Launch the TUI
 srl
+
+# List all decks
+srl --list
 
 # Export backup (JSON)
 srl --export-backup ~/backup.json
@@ -68,6 +66,17 @@ srl --import-anki vocab.txt --import-anki-name "Spanish"
 srl --export-anki my_decks.apkg
 ```
 
+## Configuration
+
+Settings persist in `config.toml` (Linux: `~/.config/flashcards/config.toml`,
+Windows: `%APPDATA%\flashcards\config.toml`) and can also be changed from the
+deck list:
+
+```toml
+theme = "default"        # press t to cycle
+new_per_session = 20     # press +/- on the deck list to adjust (±5)
+```
+
 ## Keyboard Shortcuts
 
 ### Deck List
@@ -77,20 +86,24 @@ srl --export-anki my_decks.apkg
 | `Enter` | Study deck |
 | `b` | Browse cards |
 | `s` | Statistics |
-| `n` | New deck |
-| `d` | Delete deck |
+| `n` | New deck (type a name) |
+| `r` | Rename deck |
+| `i` | Import backup (type a path) |
+| `d` | Delete deck (press twice) |
 | `x` | Export backup |
+| `+/-` | New cards per session (±5) |
 | `t` | Cycle theme |
 | `q` | Quit |
 
 ### Study Mode
 | Key | Action |
 |-----|--------|
-| `Space` | Show answer |
+| `Space` | Show answer (press again to flip back) |
 | `1-4` | Rate recall (Again/Hard/Good/Easy) |
 | `a` | Add card |
 | `b` | Browse cards |
-| `Esc` | Back to decks |
+| `t` | Cycle theme |
+| `Esc`/`q` | Back to decks |
 
 ### Card Browser
 | Key | Action |
@@ -99,6 +112,7 @@ srl --export-anki my_decks.apkg
 | `e` | Edit card |
 | `d` | Delete card (press twice) |
 | `a` | Add card |
+| `t` | Cycle theme |
 | `Esc` | Back |
 
 ### Edit Mode
@@ -180,11 +194,16 @@ srl --import-anki vocab.txt --import-anki-name "Vocabulary"
 
 **Preserved on import:**
 - Card content (front/back)
-- Interval (days until next review)
+- Due dates (recomputed from the collection's creation date, so cards that
+  were due or overdue in Anki stay due after import)
+- Interval (days until the next review)
 - Ease factor
 - Repetition count
 - Lapse count
 - Tags
+
+Notes with multiple card templates (e.g. "Basic (and reversed card)") import
+their first template only.
 
 ### Export to Anki
 
@@ -206,10 +225,13 @@ The exported `.apkg` file can be imported directly into Anki Desktop or AnkiMobi
 ### CSV Format
 
 ```csv
-front,back
-Question 1,Answer 1
+front,back,tags
+Question 1,Answer 1,tag1 tag2
 Question 2,Answer 2
 ```
+
+The tags column is optional. Quoted fields containing commas are supported;
+a leading header row is skipped when its first cell is `front`.
 
 ### Anki Text Export
 
