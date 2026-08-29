@@ -1,0 +1,37 @@
+name: build-arm64
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (aarch64 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cross C compiler (for bundled SQLite)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: srl-aarch64-linux-gnu
+          path: target/aarch64-unknown-linux-gnu/release/srl
